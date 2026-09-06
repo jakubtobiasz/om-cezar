@@ -110,7 +110,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   {
     id: 'worktrees',
     title: 'Worktrees',
-    description: 'How many finished task worktrees this project keeps on disk.',
+    description: 'Setup and teardown commands, and how many finished task worktrees stay on disk.',
     icon: FolderGit2Icon,
     component: WorktreesSection,
     scope: 'project',

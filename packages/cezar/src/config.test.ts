@@ -373,3 +373,63 @@ describe('loadConfig machine-wide agent defaults', () => {
     expect(config.systemPrompt).toBe('be brief');
   });
 });
+
+/**
+ * Worktree setup/teardown commands. Same additive contract as every other key:
+ * absent = no commands, and a bad value degrades to unset without taking the rest
+ * of the config with it.
+ */
+describe('worktreeSetup / worktreeTeardown', () => {
+  let repoRoot: string;
+
+  beforeEach(() => {
+    repoRoot = mkdtempSync(join(tmpdir(), 'cez-config-'));
+    mkdirSync(join(repoRoot, '.ai/cezar'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(repoRoot, { recursive: true, force: true });
+  });
+
+  const write = (value: unknown) =>
+    writeFileSync(join(repoRoot, '.ai/cezar', 'config.json'), JSON.stringify(value), 'utf8');
+
+  it('is undefined when absent — old config files load unchanged', async () => {
+    write({ maxParallel: 5 });
+    const config = await loadConfig(repoRoot);
+    expect(config.worktreeSetup).toBeUndefined();
+    expect(config.worktreeTeardown).toBeUndefined();
+    expect(config.maxParallel).toBe(5);
+  });
+
+  it('round-trips command lists, trimmed', async () => {
+    write({
+      worktreeSetup: ['  docker compose up -d  ', 'npm ci'],
+      worktreeTeardown: ['docker compose down -v'],
+    });
+    const config = await loadConfig(repoRoot);
+    expect(config.worktreeSetup).toEqual(['docker compose up -d', 'npm ci']);
+    expect(config.worktreeTeardown).toEqual(['docker compose down -v']);
+  });
+
+  it('degrades a wrong-typed value to unset, keeping the rest', async () => {
+    write({ worktreeSetup: 'docker compose up -d', baseBranch: 'develop' });
+    const config = await loadConfig(repoRoot);
+    expect(config.worktreeSetup).toBeUndefined();
+    expect(config.baseBranch).toBe('develop');
+  });
+
+  it('degrades a blank entry and an over-long one to unset, keeping the rest', async () => {
+    write({ worktreeSetup: ['npm ci', '   '], baseBranch: 'develop' });
+    expect((await loadConfig(repoRoot)).worktreeSetup).toBeUndefined();
+    write({ worktreeSetup: ['x'.repeat(2001)], baseBranch: 'develop' });
+    const config = await loadConfig(repoRoot);
+    expect(config.worktreeSetup).toBeUndefined();
+    expect(config.baseBranch).toBe('develop');
+  });
+
+  it('degrades a list past the 20-command cap to unset', async () => {
+    write({ worktreeSetup: Array.from({ length: 21 }, (_, i) => `echo ${i}`) });
+    expect((await loadConfig(repoRoot)).worktreeSetup).toBeUndefined();
+  });
+});

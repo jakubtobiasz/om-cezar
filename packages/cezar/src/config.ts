@@ -30,6 +30,10 @@ export const DEFAULT_WORKTREE_RETENTION = 10;
  *  schema enforces (and mirrors the workspace default's bounds). */
 const worktreeRetentionSchema = z.number().int().min(0).max(1000);
 
+/** Shell commands a project runs around a task worktree's life (`worktree-setup.ts`).
+ *  Bounded on both axes because this file is parsed on every run start. */
+const worktreeCommandsSchema = z.array(z.string().trim().min(1).max(2000)).max(20);
+
 const configSchema = z.object({
   skillsRepos: z.array(skillsRepoSchema).default(DEFAULT_SKILLS_REPOS),
   /** How many tasks may run at once (spec 006). Non-git dirs always run 1. */
@@ -42,6 +46,22 @@ const configSchema = z.object({
    * bad value degrades to the default instead of discarding the rest.
    */
   worktreeRetention: worktreeRetentionSchema.default(DEFAULT_WORKTREE_RETENTION).catch(DEFAULT_WORKTREE_RETENTION),
+  /**
+   * Project bring-up for a fresh task worktree, run in order before the first agent
+   * step. A non-zero exit fails the run: an agent turned loose in a half-built
+   * worktree burns a whole run rediscovering that. Only FRESH worktrees run these — a
+   * reused one is already set up (`WorktreeInfo.created`) and a `worktree: false` run
+   * works in the user's own checkout. `.catch(undefined)` is the usual additive-safe
+   * degradation: a bad value means "no setup", not a discarded config.
+   */
+  worktreeSetup: worktreeCommandsSchema.optional().catch(undefined),
+  /**
+   * The mirror, run just before a worktree is removed. Without it a setup's
+   * `docker compose up -d` leaks a stack per task — retention (#483) reclaims
+   * directories silently, so nothing else would ever say the containers are orphaned.
+   * Best-effort: a failure is reported and never blocks the removal.
+   */
+  worktreeTeardown: worktreeCommandsSchema.optional().catch(undefined),
   /**
    * Per-task memory ceiling in MiB (whole process tree). When a running task's
    * RSS crosses this the engine pauses it with a warning and lets the queue

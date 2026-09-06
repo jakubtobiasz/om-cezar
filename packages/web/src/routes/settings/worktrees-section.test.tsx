@@ -35,6 +35,8 @@ function serve(config: Partial<ConfigResponse> = {}) {
     worktreeRetention: 10,
     liveTitleUpdates: null,
     reviewGate: null,
+    worktreeSetup: [],
+    worktreeTeardown: [],
     ...config,
   }
   const json = (payload: unknown, status = 200) =>
@@ -50,6 +52,9 @@ function serve(config: Partial<ConfigResponse> = {}) {
       if (url === '/api/v1/config' && method === 'PUT') {
         if (body?.worktreeRetention !== undefined) {
           state.worktreeRetention = body.worktreeRetention as number
+        }
+        for (const key of ['worktreeSetup', 'worktreeTeardown'] as const) {
+          if (body?.[key] !== undefined) state[key] = (body[key] ?? []) as string[]
         }
         return json(state)
       }
@@ -143,5 +148,82 @@ describe('Project settings → Worktrees: keep-last-N-worktrees (#483)', () => {
       expect(document.querySelector('[data-slot="resources-retention-invalid"]')).not.toBeNull()
     }
     expect(puts()).toHaveLength(0)
+  })
+})
+
+describe('Project settings → Worktrees: setup and teardown commands', () => {
+  const area = (slot: string) => document.querySelector<HTMLTextAreaElement>(`[data-slot="${slot}"]`)
+  const save = (slot: string) => document.querySelector<HTMLButtonElement>(`[data-action="${slot}-save"]`)
+
+  it('renders the configured commands, one per line, with Save disabled', async () => {
+    serve({ worktreeSetup: ['docker compose up -d', 'npm ci'], worktreeTeardown: ['docker compose down -v'] })
+    renderAt('/settings/worktrees')
+    await waitFor(() => expect(area('worktree-setup')).not.toBeNull())
+    expect(area('worktree-setup')!.value).toBe('docker compose up -d\nnpm ci')
+    expect(area('worktree-teardown')!.value).toBe('docker compose down -v')
+    expect(save('worktree-setup')!.disabled).toBe(true)
+  })
+
+  it('saves a list through PUT /api/v1/config, dropping blank lines', async () => {
+    serve()
+    renderAt('/settings/worktrees')
+    await waitFor(() => expect(area('worktree-setup')).not.toBeNull())
+
+    fireEvent.change(area('worktree-setup')!, { target: { value: 'docker compose up -d\n\n  npm ci  \n' } })
+    expect(save('worktree-setup')!.disabled).toBe(false)
+    fireEvent.click(save('worktree-setup')!)
+
+    await waitFor(() =>
+      expect(
+        requests.some(
+          (r) =>
+            r.method === 'PUT' &&
+            JSON.stringify((r.body as { worktreeSetup?: unknown })?.worktreeSetup) ===
+              JSON.stringify(['docker compose up -d', 'npm ci']),
+        ),
+      ).toBe(true),
+    )
+  })
+
+  it('sends [] when the textarea is emptied — the clear path', async () => {
+    serve({ worktreeTeardown: ['docker compose down -v'] })
+    renderAt('/settings/worktrees')
+    await waitFor(() => expect(area('worktree-teardown')).not.toBeNull())
+
+    fireEvent.change(area('worktree-teardown')!, { target: { value: '' } })
+    fireEvent.click(save('worktree-teardown')!)
+
+    await waitFor(() =>
+      expect(
+        requests.some(
+          (r) => r.method === 'PUT' && JSON.stringify((r.body as { worktreeTeardown?: unknown })?.worktreeTeardown) === '[]',
+        ),
+      ).toBe(true),
+    )
+  })
+
+  it('names the placeholders under each editor', async () => {
+    serve()
+    renderAt('/settings/worktrees')
+    await waitFor(() => expect(area('worktree-setup')).not.toBeNull())
+    const text = document.querySelector('[data-slot="worktrees-section"]')!.textContent!
+    for (const name of ['repo_path', 'worktree_path', 'run_id', 'branch', 'base_branch']) {
+      expect(text).toContain(`{{ ${name} }}`)
+    }
+    expect(text).toContain('$CEZ_RUN_ID')
+  })
+
+  it('blocks Save and explains when a list is past the caps', async () => {
+    serve()
+    renderAt('/settings/worktrees')
+    await waitFor(() => expect(area('worktree-setup')).not.toBeNull())
+
+    fireEvent.change(area('worktree-setup')!, { target: { value: Array.from({ length: 21 }, () => 'true').join('\n') } })
+    expect(save('worktree-setup')!.disabled).toBe(true)
+    expect(document.querySelector('[data-slot="worktree-setup-invalid"]')?.textContent).toContain('At most 20')
+
+    fireEvent.change(area('worktree-setup')!, { target: { value: 'x'.repeat(2001) } })
+    expect(save('worktree-setup')!.disabled).toBe(true)
+    expect(document.querySelector('[data-slot="worktree-setup-invalid"]')?.textContent).toContain('2000 characters')
   })
 })

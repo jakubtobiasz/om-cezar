@@ -85,6 +85,8 @@ describe('the config API', () => {
       worktreeRetention: 10,
       liveTitleUpdates: null,
       reviewGate: null,
+      worktreeSetup: [],
+      worktreeTeardown: [],
     });
   });
 
@@ -202,6 +204,8 @@ describe('the config API', () => {
       worktreeRetention: 10,
       liveTitleUpdates: null,
       reviewGate: null,
+      worktreeSetup: [],
+      worktreeTeardown: [],
     });
   });
 
@@ -218,6 +222,31 @@ describe('the config API', () => {
     await put({ worktreeRetention: null });
     expect(rawFile().worktreeRetention).toBeUndefined();
     expect((await getBody()).worktreeRetention).toBe(10);
+  });
+
+  it('PUT worktreeSetup/worktreeTeardown persist, and null or [] clears the key', async () => {
+    const res = await put({ worktreeSetup: ['docker compose up -d', 'npm ci'] });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ worktreeSetup: ['docker compose up -d', 'npm ci'] });
+    expect(rawFile().worktreeSetup).toEqual(['docker compose up -d', 'npm ci']);
+
+    await put({ worktreeTeardown: ['docker compose down -v'] });
+    expect(rawFile().worktreeTeardown).toEqual(['docker compose down -v']);
+    // Independent keys: writing one never clobbers the other.
+    expect(rawFile().worktreeSetup).toEqual(['docker compose up -d', 'npm ci']);
+
+    // An emptied textarea arrives as [] and means "no commands"; null does too.
+    await put({ worktreeSetup: [] });
+    expect(rawFile().worktreeSetup).toBeUndefined();
+    expect((await getBody()).worktreeSetup).toEqual([]);
+    await put({ worktreeTeardown: null });
+    expect(rawFile().worktreeTeardown).toBeUndefined();
+  });
+
+  it('rejects an over-long or over-count command list with 400', async () => {
+    expect((await put({ worktreeSetup: ['x'.repeat(2001)] })).status).toBe(400);
+    expect((await put({ worktreeSetup: Array.from({ length: 21 }, () => 'true') })).status).toBe(400);
+    expect((await put({ worktreeSetup: 'docker compose up -d' })).status).toBe(400);
   });
 
   it('rejects a negative or over-limit worktreeRetention with 400', async () => {

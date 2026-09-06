@@ -2,8 +2,14 @@ import { execFile } from 'node:child_process';
 import { existsSync, realpathSync, type Dirent } from 'node:fs';
 import { readdir, readFile, rm, stat } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
+import { loadConfig } from './config.ts';
 import { resolveTaskDiffBase } from './git-diff-base.ts';
 import { isSafeGitRef } from './git-refs.ts';
+import {
+  runWorktreeCommands,
+  TEARDOWN_TIMEOUT_MS,
+  worktreeCommandEnv,
+} from './worktree-setup.ts';
 
 /**
  * Git worktree per task (spec 006). Each run gets its own branch
@@ -89,6 +95,11 @@ export interface WorktreeInfo {
   branch: string;
   /** Branch name the worktree was forked from (commit sha when HEAD was detached). */
   baseBranch: string;
+  /** True only when this call checked the tree out (`git worktree add`), false on every
+   *  reuse path. `createWorktree` is idempotent, so without this its callers cannot tell
+   *  a new worktree from a re-found one — and `worktreeSetup` must run once per
+   *  materialized directory, not again on every resume. */
+  created: boolean;
 }
 
 /** Parse `git worktree list --porcelain` without assuming paths contain no spaces. */
@@ -112,8 +123,13 @@ async function registeredWorktrees(repoRoot: string): Promise<RegisteredWorktree
   return worktrees;
 }
 
-function worktreeInfo(path: string, branch: string, baseBranch: string): WorktreeInfo {
-  return { path, branch, baseBranch };
+function worktreeInfo(
+  path: string,
+  branch: string,
+  baseBranch: string,
+  created: boolean,
+): WorktreeInfo {
+  return { path, branch, baseBranch, created };
 }
 
 /** Git canonicalizes symlinked path prefixes (macOS `/var` → `/private/var`). */
@@ -165,7 +181,7 @@ export async function createWorktree(
         `managed worktree path is registered to ${atPath.branch ?? 'a detached HEAD'}, expected ${branchRef}`,
       );
     }
-    return worktreeInfo(atPath.path, branch, base);
+    return worktreeInfo(atPath.path, branch, base, false);
   }
 
   // If the directory survived but its administrative entry did not, let Git
@@ -181,7 +197,7 @@ export async function createWorktree(
           `managed worktree path is registered to ${atPath.branch ?? 'a detached HEAD'}, expected ${branchRef}`,
         );
       }
-      return worktreeInfo(atPath.path, branch, base);
+      return worktreeInfo(atPath.path, branch, base, false);
     }
     const entries = await readdir(absolutePath).catch(() => ['unreadable']);
     if (entries.length > 0) {
@@ -199,20 +215,20 @@ export async function createWorktree(
       if (basename(byBranch.path) !== runId) {
         throw new Error(`task branch ${branch} is already checked out at ${byBranch.path}`);
       }
-      return worktreeInfo(byBranch.path, branch, base);
+      return worktreeInfo(byBranch.path, branch, base, false);
     }
     const attach = await git(repoRoot, ['worktree', 'add', absolutePath, branch]);
     if (!attach.ok) {
       throw new Error(`git worktree reattach failed: ${attach.stderr.trim() || attach.stdout.trim()}`);
     }
-    return worktreeInfo(absolutePath, branch, base);
+    return worktreeInfo(absolutePath, branch, base, true);
   }
 
   const create = await git(repoRoot, ['worktree', 'add', '-b', branch, absolutePath, base]);
   if (!create.ok) {
     throw new Error(`git worktree add failed: ${create.stderr.trim() || create.stdout.trim()}`);
   }
-  return worktreeInfo(absolutePath, branch, base);
+  return worktreeInfo(absolutePath, branch, base, true);
 }
 
 /**
@@ -235,16 +251,52 @@ export function worktreeSizeBytes(path: string): Promise<number | null> {
   });
 }
 
-/** Remove a task worktree and its branch. Best effort — never throws. */
+/** The project's `worktreeTeardown`, run while the directory still exists. Bounded and
+ *  best-effort: this sits in front of EVERY removal path (the button, run deletion, a
+ *  losing variant, retention's sweep, the orphan sweep) and none may be wedged by a
+ *  project's own command. Returns notes worth surfacing. */
+async function runTeardown(repoRoot: string, worktreePath: string): Promise<string[]> {
+  if (!existsSync(worktreePath)) return []; // already gone — nothing to tear down
+  const commands = await loadConfig(repoRoot)
+    .then((config) => config.worktreeTeardown ?? [])
+    .catch(() => []);
+  if (commands.length === 0) return [];
+  const context = {
+    runId: basename(worktreePath),
+    worktree: worktreePath,
+    repoRoot,
+    branch: branchFor(basename(worktreePath)),
+    baseBranch: '', // the fork point is not worth a git call on a removal path
+  };
+  const failure = await runWorktreeCommands({
+    commands,
+    cwd: worktreePath,
+    env: worktreeCommandEnv(context),
+    context,
+    timeoutMs: TEARDOWN_TIMEOUT_MS,
+  }).catch(() => null);
+  if (!failure) return [];
+  return [`worktree teardown failed (exit ${failure.exitCode}): ${failure.command}\n${failure.output}`];
+}
+
+/**
+ * Remove a task worktree and its branch. Best effort — never throws.
+ *
+ * `worktreeTeardown` runs first: retention reclaims directories silently, so this is
+ * the only place that can tell a project its containers are about to be orphaned. A
+ * teardown failure comes back as a note and never blocks the removal.
+ */
 export async function removeWorktree(
   repoRoot: string,
   worktreePath: string,
   branch?: string,
-): Promise<void> {
+): Promise<string[]> {
+  const notes = await runTeardown(repoRoot, worktreePath);
   await git(repoRoot, ['worktree', 'remove', '--force', worktreePath]);
   await rm(worktreePath, { recursive: true, force: true }).catch(() => undefined);
   await git(repoRoot, ['worktree', 'prune']);
   if (branch) await git(repoRoot, ['branch', '-D', branch]);
+  return notes;
 }
 
 /**

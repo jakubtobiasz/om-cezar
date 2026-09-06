@@ -4251,7 +4251,13 @@ export function createApp(deps: ServerDeps) {
       const run = store.getRun(id);
       if (!run) return c.json({ error: 'not found' }, 404);
       if (manager.isActive(id)) return c.json({ error: 'run is active — cancel it first' }, 409);
-      if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
+      if (run.worktreePath) {
+        // A failing `worktreeTeardown` never blocks the removal, but the user pressed
+        // this button — a leaked container stack has to be visible somewhere.
+        for (const note of await removeWorktree(repoRoot, run.worktreePath, run.branch)) {
+          store.appendEvent(id, { type: 'note', message: note });
+        }
+      }
       store.updateRun(id, { worktreePath: undefined, branch: undefined });
       return c.json({ removed: true });
     })
@@ -4345,7 +4351,11 @@ export function createApp(deps: ServerDeps) {
 
       for (const loser of losers) {
         if (manager.isActive(loser.id)) manager.cancel(loser.id);
-        if (loser.worktreePath) await removeWorktree(repoRoot, loser.worktreePath, loser.branch);
+        if (loser.worktreePath) {
+          for (const note of await removeWorktree(repoRoot, loser.worktreePath, loser.branch)) {
+            store.appendEvent(loser.id, { type: 'note', message: note });
+          }
+        }
         store.updateRun(loser.id, { worktreePath: undefined, branch: undefined });
         store.setArchived(loser.id, true);
         store.appendEvent(loser.id, {
@@ -5127,6 +5137,9 @@ export function createApp(deps: ServerDeps) {
       // Optional review gate (#489): tri-state — null means "no config key, the
       // CEZ_REVIEW_GATE env default (OFF) decides".
       reviewGate: config.reviewGate ?? null,
+      // Setup/teardown commands (Settings → Worktrees). Always an array; `[]` = unset.
+      worktreeSetup: config.worktreeSetup ?? [],
+      worktreeTeardown: config.worktreeTeardown ?? [],
     };
   };
   // ---- chained family: per-repo config (project-scoped) ----
@@ -5178,6 +5191,13 @@ export function createApp(deps: ServerDeps) {
         if (parsed.data.reviewGate === null) delete raw.reviewGate;
         else raw.reviewGate = parsed.data.reviewGate;
       }
+      for (const key of ['worktreeSetup', 'worktreeTeardown'] as const) {
+        const value = parsed.data[key];
+        if (value === undefined) continue;
+        // null and [] both clear: an emptied textarea means "no commands".
+        if (value === null || value.length === 0) delete raw[key];
+        else raw[key] = value;
+      }
       if (parsed.data.memoryLimitMb !== undefined) {
         // null or 0 both mean "no ceiling" — drop the key back to the default.
         if (parsed.data.memoryLimitMb === null || parsed.data.memoryLimitMb === 0) {
@@ -5216,6 +5236,11 @@ export function createApp(deps: ServerDeps) {
   // the file. All fields optional + additive: `null` (and `''` for the
   // R6 keys) clears a knob back to its default.
   const modelPresetSchema = z.string().trim().max(200).nullable().optional();
+  const worktreeCommandsSchema = z
+    .array(z.string().trim().min(1).max(2000))
+    .max(20)
+    .nullable()
+    .optional();
   const setConfigSchema = z.object({
     baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
     defaultRunner: z.enum(RUNNER_IDS).optional(),
@@ -5242,6 +5267,9 @@ export function createApp(deps: ServerDeps) {
     // Optional review gate toggle (Settings → Agents, #489): null clears the key
     // back to the env-default behavior (OFF).
     reviewGate: z.boolean().nullable().optional(),
+    // Worktree setup/teardown commands (Settings → Worktrees): null or [] clears.
+    worktreeSetup: worktreeCommandsSchema,
+    worktreeTeardown: worktreeCommandsSchema,
   });
   const setAgentConfigSchema = z.object({
     content: z.string().max(2_000_000),

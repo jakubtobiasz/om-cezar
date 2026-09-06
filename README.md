@@ -298,6 +298,18 @@ Five moves that make the cockpit worth the browser tab:
   unlimited) and reclaims the rest — directory only, the `cez/<id8>` branch is
   always kept, so the work stays recoverable. Settings → Resources shows every
   worktree's disk use with per-row delete and a **Reclaim now** button.
+- 🔧 **Worktree setup scripts.** A task worktree is a bare checkout — no containers,
+  no dependencies, no fixtures. List your project's bring-up in `worktreeSetup`
+  (Settings → Worktrees, or `.ai/cezar/config.json`) and it runs in the fresh
+  worktree before the agent starts; a non-zero exit fails the task instead of turning
+  an agent loose on a half-built tree. `worktreeTeardown` is the mirror, run before
+  the worktree is removed — including a retention reclaim — so a `docker compose up`
+  never outlives its task. `$CEZ_RUN_ID` is in the environment, so
+  `COMPOSE_PROJECT_NAME=cez-$CEZ_RUN_ID` keeps parallel tasks off each other's ports.
+  Commands can also use `{{ repo_path }}`, `{{ worktree_path }}`, `{{ run_id }}`,
+  `{{ branch }}` and `{{ base_branch }}`, which expand **shell-quoted** — so
+  `cp {{ repo_path }}/auth.json .` pulls a gitignored file into every task worktree and
+  keeps working when the path has a space in it.
 - 🛡️ **Review gate.** A finished run with changes waits in `review`. Read the diff,
   type notes that go straight back into the agent's session, or push a
   `gh pr create --draft`. You stay the merge button.
@@ -708,6 +720,24 @@ never blocks startup):
   // the source against a moving branch head — cezar verifies it resolves to
   // exactly that commit, and reports it as `team.commit`.
   "worktreeRetention": 10,   // keep the last N finished worktrees on disk; 0 = unlimited (branch always kept)
+  // Project bring-up for a fresh task worktree — a bare checkout has no containers,
+  // no dependencies and no fixtures. Run in order before the first agent step; a
+  // non-zero exit fails the task before any agent starts. Also in Settings → Worktrees.
+  // Each runs through `bash -lc` with the worktree as its cwd. {{ repo_path }},
+  // {{ worktree_path }}, {{ run_id }}, {{ branch }} and {{ base_branch }} expand
+  // SHELL-QUOTED, so they need no quotes of their own and survive a path with spaces.
+  // (Anything else in {{ }} is left alone — `docker inspect -f '{{.Name}}'` still works.)
+  // The same values are in the environment as $CEZ_REPO_ROOT, $CEZ_WORKTREE, $CEZ_RUN_ID,
+  // $CEZ_BRANCH and $CEZ_BASE_BRANCH, which is what COMPOSE_PROJECT_NAME wants below.
+  "worktreeSetup": [
+    "cp {{ repo_path }}/auth.json .",
+    "COMPOSE_PROJECT_NAME=cez-$CEZ_RUN_ID docker compose up -d",
+    "npm ci"
+  ],
+  // The mirror, run just before a worktree is removed (including a retention reclaim),
+  // so a stack started at setup does not outlive its task. Best effort: a failure is
+  // reported and never blocks the removal.
+  "worktreeTeardown": ["docker compose down -v"],
   "defaultRunner": "claude", // agent backend: "claude" (default) · "codex" · "opencode" · "pi"
   "modelsLocked": true,      // optional: native per-runner model is fixed/read-only; runner stays selectable
   "plannerModel": "sonnet",  // model the "Plan first" button uses to draft chains

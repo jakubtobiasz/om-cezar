@@ -12,6 +12,7 @@ import {
 } from './core/provider-auth.ts';
 import { applyProviderEnablement } from './core/provider-availability.ts';
 import { pruneOrphans } from './git-worktree.ts';
+import { WORKTREE_SETUP_ITEM_NAME } from './worktree-setup.ts';
 import { getRepoInfo } from './server/git.ts';
 import { DEFAULT_WORKTREE_RETENTION, loadConfig, resolveWorktreeRetention } from './config.ts';
 import { reclaimWorktrees } from './runs/retention.ts';
@@ -417,6 +418,16 @@ async function runCommand(
       case 'check-output':
         console.log(String(event.text ?? ''));
         break;
+      case 'item.completed': {
+        // Headless renders v1 only, so an agent's v2 tool items are covered by the
+        // v1 `tool-call`/`tool-result` twins above. Worktree setup has no v1 twin —
+        // it is v2-only so the cockpit can stream it — hence this one narrow case.
+        const item = event.item;
+        if (!item || typeof item !== 'object') break;
+        const { name, output } = item as { name?: unknown; output?: unknown };
+        if (name === WORKTREE_SETUP_ITEM_NAME && typeof output === 'string') console.log(output);
+        break;
+      }
       case 'step-start':
         console.log(`\n── step: ${String(event.name)} ${Number(event.iteration) > 1 ? `(attempt ${event.iteration})` : ''}`);
         break;

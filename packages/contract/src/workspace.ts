@@ -332,6 +332,10 @@ export const configResponseSchema = z.object({
   /** Optional review gate (#489): null = no config key, the `CEZ_REVIEW_GATE` env default (OFF)
    *  decides. */
   reviewGate: z.boolean().nullable(),
+  /** Shell commands run in a fresh task worktree before the first agent step; `[]` = none. */
+  worktreeSetup: z.array(z.string()),
+  /** Shell commands run in a task worktree just before it is removed; `[]` = none. */
+  worktreeTeardown: z.array(z.string()),
 });
 export type ConfigResponse = z.infer<typeof configResponseSchema>;
 
@@ -346,6 +350,28 @@ export type SetConfigResponse = z.infer<typeof setConfigResponseSchema>;
  * config.json server-side — `defaultModels` merges per runner, so one write never clobbers
  * another runner's preset.
  */
+/**
+ * Placeholders a worktree setup/teardown command may use, shared by the executor and the
+ * Settings editor. Each expands to a SHELL-QUOTED value, so `cp {{ repo_path }}/auth.json .`
+ * needs no quoting of its own and survives a path with spaces. Anything else in `{{ }}` is
+ * left verbatim — `docker inspect -f '{{.Name}}'` is Go templating and must pass through.
+ */
+export const WORKTREE_TEMPLATE_VARS = [
+  'repo_path',
+  'worktree_path',
+  'run_id',
+  'branch',
+  'base_branch',
+] as const;
+
+export type WorktreeTemplateVar = (typeof WORKTREE_TEMPLATE_VARS)[number];
+
+const worktreeCommandsInputSchema = z
+  .array(z.string().trim().min(1).max(2000))
+  .max(20)
+  .nullable()
+  .optional();
+
 export const setConfigInputSchema = z.object({
   baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
   defaultRunner: runnerSchema.optional(),
@@ -367,6 +393,9 @@ export const setConfigInputSchema = z.object({
   liveTitleUpdates: z.boolean().nullable().optional(),
   /** null clears the key back to the env-default behavior (OFF). */
   reviewGate: z.boolean().nullable().optional(),
+  /** Worktree setup/teardown commands. `null` or `[]` clears the key. */
+  worktreeSetup: worktreeCommandsInputSchema,
+  worktreeTeardown: worktreeCommandsInputSchema,
 });
 export type SetConfigInput = z.infer<typeof setConfigInputSchema>;
 

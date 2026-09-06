@@ -43,7 +43,15 @@ import { materializeSkillDir } from '../skills-remote.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
 import { loadConfig, resolveWorktreeRetention } from '../config.ts';
-import { autosaveCommit, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
+import { autosaveCommit, branchFor, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
+import {
+  runWorktreeCommands,
+  SETUP_TIMEOUT_MS,
+  WORKTREE_SETUP_ITEM_NAME,
+  worktreeCommandEnv,
+  type WorktreeCommandContext,
+  type WorktreeCommandResult,
+} from '../worktree-setup.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows } from './load.ts';
 import type { QueuedMessage, RunRecord, RunStore, StepState } from '../runs/store.ts';
@@ -62,7 +70,7 @@ import { resolveProfileEnvForRoot } from '../workspace/agent-profiles.ts';
 import { DEFAULT_AGENT_ACCOUNT_ID } from '../workspace/agent-accounts.ts';
 import { WorkspaceSemaphore, type AccountHolds } from '../workspace/semaphore.ts';
 import { UiEventSink } from '../runs/ui-event-sink.ts';
-import type { UiEvent } from '../core/ui-events.ts';
+import type { ToolStatus, UiEvent, UiToolItem } from '../core/ui-events.ts';
 import { chainStepNote, DEFAULT_ALLOWED_TOOLS, stepKind, type WorkflowDef, type WorkflowStepDef } from './types.ts';
 
 const CHECK_OUTPUT_CAP = 20_000;
@@ -2228,7 +2236,7 @@ export class RunManager {
     // the stamp so the session regains its isolated tree and the run is eligible
     // for retention again — otherwise it keeps a dir on disk while staying
     // invisible to the enforcer forever. Best-effort; falls back to repoRoot.
-    await rematerializeReclaimedWorktree(this.repoRoot, this.store, runId);
+    const rematerialized = await rematerializeReclaimedWorktree(this.repoRoot, this.store, runId);
     const record = this.store.getRun(runId);
     // The env is a live ceiling: a run created while the inbox was on must not keep writing
     // follow-ups after it is switched off.
@@ -2240,6 +2248,37 @@ export class RunManager {
     const state: ActiveRun = { cancelled: false, interrupt: () => undefined, cwd };
     this.active.set(runId, state);
     this.starting.delete(runId);
+    // Retention took the directory, and its containers and dependencies with it —
+    // rebuild the project's environment before resuming.
+    if (rematerialized && record && state.cwd !== this.repoRoot) {
+      const emit = (event: { type: string; [k: string]: unknown }) => this.store.appendEvent(runId, event);
+      const config = await loadConfig(this.repoRoot).catch(() => null);
+      const failure = await this.runWorktreeSetup(
+        state,
+        {
+          runId,
+          worktree: state.cwd,
+          repoRoot: this.repoRoot,
+          branch: record.branch ?? branchFor(runId),
+          baseBranch: record.baseBranch ?? '',
+        },
+        config?.worktreeSetup ?? [],
+        emit,
+      );
+      if (failure && !state.cancelled) {
+        const error = `worktree setup failed: ${failure.command} (exit ${failure.exitCode})`;
+        emit({ type: 'note', message: `${error} — continuation stopped` });
+        this.store.updateRun(runId, {
+          status: 'failed',
+          error,
+          finishedAt: new Date().toISOString(),
+          currentStepId: undefined,
+        });
+        emit({ type: 'lifecycle', message: `run failed — ${error}` });
+        this.dropActive(runId);
+        return;
+      }
+    }
     if (state.cwd === this.repoRoot) {
       if (repositoryRootLockDisabled()) {
         this.store.appendEvent(runId, {
@@ -2671,6 +2710,9 @@ export class RunManager {
           });
         }
       }
+      // Set only when THIS call checked the tree out — setup runs once per
+      // materialized directory, not again on every reuse.
+      let setupContext: WorktreeCommandContext | undefined;
       try {
         const wt = await createWorktree(this.repoRoot, runId, base);
         state.cwd = wt.path;
@@ -2686,7 +2728,15 @@ export class RunManager {
         if (seededConfig.length > 0) {
           emit({ type: 'note', message: `seeded personal agent config: ${seededConfig.join(', ')}` });
         }
-        this.armAutosave(state);
+        if (wt.created) {
+          setupContext = {
+            runId,
+            worktree: wt.path,
+            repoRoot: this.repoRoot,
+            branch: wt.branch,
+            baseBranch: wt.baseBranch,
+          };
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const error = `worktree creation failed: ${message}`;
@@ -2701,6 +2751,27 @@ export class RunManager {
         this.dropActive(runId);
         return;
       }
+      // The project's own bring-up. Outside the try above on purpose: a failing setup
+      // command is not a worktree creation failure and must not be reported as one.
+      if (setupContext) {
+        const failure = await this.runWorktreeSetup(state, setupContext, config.worktreeSetup ?? [], emit);
+        // A cancel kills the command and surfaces here as a failure; that is a
+        // cancelled run. Fall through — the step loop breaks on `cancelled`.
+        if (failure && !state.cancelled) {
+          const error = `worktree setup failed: ${failure.command} (exit ${failure.exitCode})`;
+          emit({ type: 'note', message: `${error} — task stopped before workflow execution` });
+          this.store.updateRun(runId, {
+            status: 'failed',
+            error,
+            finishedAt: new Date().toISOString(),
+            currentStepId: undefined,
+          });
+          emit({ type: 'lifecycle', message: `run failed — ${error}` });
+          this.dropActive(runId);
+          return;
+        }
+      }
+      this.armAutosave(state); // after setup — a periodic autosave mid-install would commit a half-installed tree
     } else {
       emit({ type: 'note', message: 'not a git repository — running in place, one task at a time' });
     }
@@ -3655,6 +3726,77 @@ export class RunManager {
       clearInterval(state.autosaveTimer);
       state.autosaveTimer = undefined;
     }
+  }
+
+  /**
+   * The project's `worktreeSetup`, streamed as protocol-v2 tool items — one execute card
+   * per command, filling in as output arrives.
+   *
+   * v2 rather than a v1 `check-output`, which is what a check step emits, because that
+   * event carries the WHOLE output and only exists once the command has exited: an
+   * `npm ci` or an image pull is minutes of a blank thread. The sink gives streaming for
+   * free and at no storage cost — `item.delta` is coalesced (~40 ms) onto the live wire
+   * and never persisted, so the NDJSON still grows by one card's worth (`item.started` +
+   * `item.completed`), exactly as the buffered version did.
+   *
+   * Returns the failing command, or null when everything passed.
+   */
+  private runWorktreeSetup(
+    state: ActiveRun,
+    context: WorktreeCommandContext,
+    commands: string[],
+    emit: (event: { type: string; stepId?: string; [k: string]: unknown }) => void,
+  ): Promise<WorktreeCommandResult | null> {
+    if (commands.length === 0) return Promise.resolve(null);
+    emit({
+      type: 'note',
+      message: `worktree setup — running ${commands.length} configured command${commands.length === 1 ? '' : 's'}`,
+    });
+    // No stepId: setup precedes every step, and `itemKey` keys on the item id alone when
+    // one is absent. The reducer's `currentTurn()` opens a fallback turn for us.
+    const sink = new UiEventSink({
+      persist: (event) => this.store.appendEvent(context.runId, event),
+      emitLive: (event) => this.store.emitEphemeral(context.runId, event),
+    });
+    let index = 0;
+    let itemId = '';
+    const card = (command: string, status: ToolStatus, extra: Partial<UiToolItem> = {}): UiToolItem => ({
+      kind: 'tool',
+      id: itemId,
+      name: WORKTREE_SETUP_ITEM_NAME,
+      toolKind: 'execute',
+      title: `Ran ${command}`,
+      status,
+      ...extra,
+    });
+    return runWorktreeCommands({
+      commands,
+      cwd: context.worktree,
+      env: worktreeCommandEnv(context),
+      context,
+      timeoutMs: SETUP_TIMEOUT_MS,
+      onStart: (command) => {
+        itemId = `worktree-setup-${index++}`;
+        emit({ type: 'note', message: `$ ${command}` });
+        sink.handle({ type: 'item.started', item: card(command, 'running') });
+      },
+      onChunk: (delta) => sink.handle({ type: 'item.delta', itemId, field: 'output', delta }),
+      onResult: (result) =>
+        sink.handle({
+          type: 'item.completed',
+          item: card(result.command, result.ok ? 'completed' : 'failed', {
+            output: result.output,
+            exitCode: result.exitCode,
+          }),
+        }),
+      // A cancel during a long install must kill the command, not wait it out.
+      onSpawn: (kill) => {
+        state.interrupt = () => kill();
+      },
+    }).finally(() => {
+      state.interrupt = () => undefined;
+      sink.flushAll();
+    });
   }
 
   private runCheckStep(

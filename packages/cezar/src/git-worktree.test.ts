@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -8,6 +8,7 @@ import {
   branchFor,
   createWorktree,
   parseShortstat,
+  removeWorktree,
   resolveBaseRef,
   worktreeShortstat,
   worktreeSizeBytes,
@@ -108,7 +109,8 @@ describe('createWorktree recovery (real git)', () => {
     const first = await createWorktree(repo, runId, 'main');
     const second = await createWorktree(repo, runId, 'main');
 
-    expect(second).toEqual(first);
+    expect(second).toEqual({ ...first, created: false });
+    expect(first.created).toBe(true);
     expect(first.baseBranch).toBe('main');
     const listed = await run('git', ['worktree', 'list', '--porcelain'], { cwd: repo });
     expect(listed.stdout.match(new RegExp(`branch refs/heads/${branchFor(runId)}`, 'g'))).toHaveLength(1);
@@ -128,6 +130,8 @@ describe('createWorktree recovery (real git)', () => {
     const recovered = await createWorktree(repo, runId, 'main');
     const log = await run('git', ['log', '-1', '--format=%s'], { cwd: recovered.path });
     expect(recovered.path).toBe(first.path);
+    // A reattach checks the tree out again, so the project's setup commands must re-run.
+    expect(recovered.created).toBe(true);
     expect(log.stdout.trim()).toBe('task progress');
     expect(() => writeFileSync(join(recovered.path, 'still-usable.txt'), 'yes\n')).not.toThrow();
   });
@@ -144,6 +148,50 @@ describe('createWorktree recovery (real git)', () => {
       'managed worktree path already exists and could not be repaired',
     );
     expect(readFileSync(marker, 'utf8')).toBe('do not delete\n');
+  });
+});
+
+describe('removeWorktree teardown (real git)', () => {
+  const configure = (repo: string, commands: string[]) => {
+    mkdirSync(join(repo, '.ai/cezar'), { recursive: true });
+    writeFileSync(
+      join(repo, '.ai/cezar', 'config.json'),
+      JSON.stringify({ worktreeTeardown: commands }),
+      'utf8',
+    );
+  };
+
+  it('runs the configured commands in the worktree before removing it', async () => {
+    const repo = await fixtureRepo('cez-worktree-teardown-');
+    const runId = '44444444-4444-4444-8444-444444444444';
+    const receipt = join(repo, 'teardown-receipt.txt');
+    // Placeholders render on the teardown path too, not just setup.
+    configure(repo, [`printf '%s %s' {{ worktree_path }} {{ run_id }} > ${receipt}`]);
+    const wt = await createWorktree(repo, runId, 'main');
+
+    expect(await removeWorktree(repo, wt.path, wt.branch)).toEqual([]);
+    // The directory still existed when the command ran — that is the whole point.
+    expect(readFileSync(receipt, 'utf8')).toBe(`${wt.path} ${runId}`);
+    expect(existsSync(wt.path)).toBe(false);
+  });
+
+  it('removes the worktree anyway when a teardown command fails, and reports it', async () => {
+    const repo = await fixtureRepo('cez-worktree-teardown-fail-');
+    const runId = '55555555-5555-4555-8555-555555555555';
+    configure(repo, ['echo nope >&2; exit 7']);
+    const wt = await createWorktree(repo, runId, 'main');
+
+    const notes = await removeWorktree(repo, wt.path, wt.branch);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('exit 7');
+    expect(existsSync(wt.path)).toBe(false);
+  });
+
+  it('is a no-op when the project configures nothing', async () => {
+    const repo = await fixtureRepo('cez-worktree-teardown-none-');
+    const wt = await createWorktree(repo, '66666666-6666-4666-8666-666666666666', 'main');
+    expect(await removeWorktree(repo, wt.path, wt.branch)).toEqual([]);
+    expect(existsSync(wt.path)).toBe(false);
   });
 });
 

@@ -47,6 +47,9 @@ export function selectReclaimableWorktrees(runs: readonly RunRecord[], keep: num
 export interface RetentionStore {
   listRuns(): RunRecord[];
   updateRun(id: string, patch: { worktreeReclaimedAt?: string }): unknown;
+  /** Optional so the existing fakes stay valid — used only to surface a failing
+   *  `worktreeTeardown`, which would otherwise leak a container stack in silence. */
+  appendEvent?(id: string, event: { type: string; message: string }): unknown;
 }
 
 /** The slice of the store the re-materializer needs. */
@@ -99,7 +102,7 @@ export interface ReclaimOptions {
   /** Directory reclaimer — defaults to the real `removeWorktree` (branch kept).
    *  Injectable so tests can exercise the "removal failed" branch without brittle
    *  filesystem-permission tricks. */
-  remove?: (repoRoot: string, worktreePath: string) => Promise<void>;
+  remove?: (repoRoot: string, worktreePath: string) => Promise<string[] | void>;
 }
 
 export async function reclaimWorktrees(
@@ -117,7 +120,9 @@ export async function reclaimWorktrees(
     const run = byId.get(id);
     if (!run?.worktreePath) continue;
     try {
-      await remove(repoRoot, run.worktreePath);
+      for (const note of (await remove(repoRoot, run.worktreePath)) ?? []) {
+        store.appendEvent?.(id, { type: 'note', message: note });
+      }
       if (existsSync(run.worktreePath)) continue; // reclaim failed; retry next pass
       store.updateRun(id, { worktreeReclaimedAt: now() });
       reclaimed.push(id);

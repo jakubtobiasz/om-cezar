@@ -37,15 +37,18 @@ async function branchExists(repo: string, runId: string): Promise<boolean> {
 }
 
 /** A tiny in-memory store exposing only what the enforcer touches. */
-function fakeStore(runs: RunRecord[]): RetentionStore & { runs: RunRecord[] } {
+function fakeStore(runs: RunRecord[]): RetentionStore & { runs: RunRecord[]; notes: string[] } {
+  const notes: string[] = [];
   return {
     runs,
+    notes,
     listRuns: () => runs,
     updateRun: (id, patch) => {
       const r = runs.find((x) => x.id === id);
       if (r) Object.assign(r, patch);
       return r;
     },
+    appendEvent: (id, event) => notes.push(`${id}: ${event.message}`),
   };
 }
 
@@ -118,5 +121,32 @@ describe('reclaimWorktrees (real git, #483)', () => {
     const store = fakeStore([finishedRun(id, wt.path, '2026-07-01T00:00:00.000Z')]);
     expect(await reclaimWorktrees(repo, store, 0)).toEqual([]);
     expect(existsSync(wt.path)).toBe(true);
+  });
+});
+
+/** A reclaim deletes the directory silently, so a failing `worktreeTeardown` is the one
+ *  thing that has to reach the run's log — otherwise the leaked stack is invisible. */
+describe('reclaimWorktrees teardown notes', () => {
+  it('records a failing teardown against the run it reclaimed', async () => {
+    const repo = await fixtureRepo();
+    const oldId = '77777777-7777-4777-8777-777777777777';
+    const newId = '88888888-8888-4888-8888-888888888888';
+    const oldWt = await createWorktree(repo, oldId, 'main');
+    const newWt = await createWorktree(repo, newId, 'main');
+    const store = fakeStore([
+      finishedRun(oldId, oldWt.path, '2026-07-01T00:00:00.000Z'),
+      finishedRun(newId, newWt.path, '2026-07-09T00:00:00.000Z'),
+    ]);
+
+    const reclaimed = await reclaimWorktrees(repo, store, 1, {
+      remove: async (_root, path) => {
+        rmSync(path, { recursive: true, force: true });
+        return ['worktree teardown failed (exit 1): docker compose down -v'];
+      },
+    });
+
+    expect(reclaimed).toEqual([oldId]);
+    expect(store.notes).toEqual([`${oldId}: worktree teardown failed (exit 1): docker compose down -v`]);
+    expect(existsSync(newWt.path)).toBe(true);
   });
 });
