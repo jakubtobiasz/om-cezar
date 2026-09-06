@@ -100,6 +100,40 @@ describe('Settings → Resources: worktrees panel (#483)', () => {
     await waitFor(() => expect(posts(/\/remove-worktree$/)).toHaveLength(1))
   })
 
+  it('the delete confirm stays up and busy while the server runs the teardown', async () => {
+    // remove-worktree runs the project's teardown commands — the dialog is the only place the
+    // user can learn that work is in flight, so it must not vanish on click.
+    let finish: (() => void) | undefined
+    serve(sample)
+    const gated = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      requests.push({ method, url })
+      if (url === '/api/v1/worktrees' && method === 'GET') {
+        return new Response(JSON.stringify(sample), { headers: { 'content-type': 'application/json' } })
+      }
+      return new Promise<Response>((resolve) => {
+        finish = () =>
+          resolve(new Response('{"removed":true}', { headers: { 'content-type': 'application/json' } }))
+      })
+    })
+    vi.stubGlobal('fetch', gated)
+
+    renderPanel()
+    await waitFor(() => expect(rows()).toHaveLength(2))
+    fireEvent.click(document.querySelector('[data-action="worktree-delete"]')!)
+    await waitFor(() => expect(confirmButton()).not.toBeNull())
+    fireEvent.click(confirmButton()!)
+
+    await waitFor(() => expect(confirmButton()!.textContent).toBe('Deleting…'))
+    expect(confirmButton()!.disabled).toBe(true)
+    expect(document.querySelector<HTMLButtonElement>('[data-slot="alert-dialog-cancel"]')!.disabled).toBe(true)
+    expect(document.body.textContent).toContain('teardown commands')
+
+    finish!()
+    await waitFor(() => expect(confirmButton()).toBeNull())
+  })
+
   it('Reclaim now calls the reclaim route (after confirming the dialog)', async () => {
     serve(sample)
     renderPanel()

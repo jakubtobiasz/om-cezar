@@ -53,7 +53,9 @@ const jsonResponse = (body: unknown, status = 200) =>
 
 /** Stubs fetch, records every request, and lets a test override specific paths. Defaults:
  *  the runs list is empty, every mutation succeeds with `{}`. */
-function stubFetch(overrides: Record<string, () => Response> = {}): SentRequest[] {
+function stubFetch(
+  overrides: Record<string, () => Response | Promise<Response>> = {},
+): SentRequest[] {
   const sent: SentRequest[] = []
   vi.stubGlobal(
     'fetch',
@@ -467,6 +469,32 @@ describe('actions hit their endpoints', () => {
     // The run is gone — the header sent us home rather than leaving a dead page up.
     await waitFor(() => {
       expect(document.querySelector('[data-slot="home-probe"]')).not.toBeNull()
+    })
+  })
+
+  it('the delete confirm stays up and busy while the server runs the teardown', async () => {
+    // Deleting removes the worktree, which runs the project's teardown commands — the dialog is
+    // the only place the user can learn that work is in flight.
+    let finish: (() => void) | undefined
+    stubFetch({
+      '/api/v1/runs/r1': () =>
+        new Promise<Response>((resolve) => {
+          finish = () => resolve(jsonResponse({}))
+        }),
+    })
+    renderHeader(run('failed'))
+    fireEvent.click(actionBar().getByRole('button', { name: 'Delete' }))
+    const dialog = await screen.findByRole('alertdialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }))
+
+    const busy = await within(dialog).findByRole('button', { name: 'Deleting…' })
+    expect((busy as HTMLButtonElement).disabled).toBe(true)
+    expect(within(dialog).getByText(/teardown commands/)).not.toBeNull()
+    expect((within(dialog).getByRole('button', { name: 'Keep it' }) as HTMLButtonElement).disabled).toBe(true)
+
+    finish?.()
+    await waitFor(() => {
+      expect(screen.queryByRole('alertdialog')).toBeNull()
     })
   })
 

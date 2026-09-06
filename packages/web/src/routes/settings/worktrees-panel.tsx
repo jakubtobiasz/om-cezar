@@ -77,10 +77,13 @@ export function WorktreesPanel() {
   const { worktrees: rows, totalBytes, keep } = worktrees.data
   const busy = reclaim.isPending || remove.isPending
 
+  // Removing a worktree runs the project's teardown commands on the server — seconds to minutes.
+  // The dialog stays up and busy until the server answers, rather than closing on click and
+  // leaving the row sitting there with nothing to say it is going away.
+  const settle = { onSettled: () => setConfirming(null) }
   const runConfirmed = () => {
-    if (confirming?.kind === 'reclaim') reclaim.mutate()
-    else if (confirming?.kind === 'delete') remove.mutate(confirming.runId)
-    setConfirming(null)
+    if (confirming?.kind === 'reclaim') reclaim.mutate(undefined, settle)
+    else if (confirming?.kind === 'delete') remove.mutate(confirming.runId, settle)
   }
 
   return (
@@ -135,7 +138,7 @@ export function WorktreesPanel() {
         </Button>
       </div>
 
-      <AlertDialog open={confirming !== null} onOpenChange={(open) => !open && setConfirming(null)}>
+      <AlertDialog open={confirming !== null} onOpenChange={(open) => !open && !busy && setConfirming(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
@@ -149,20 +152,45 @@ export function WorktreesPanel() {
                   <span className="mt-1 block truncate font-medium text-foreground" title={confirming.title}>
                     {confirming.title}
                   </span>
+                  {busy ? (
+                    <span className="mt-2 block text-xs text-soft-foreground">
+                      Running the worktree teardown commands — this can take a moment.
+                    </span>
+                  ) : null}
                 </>
               ) : (
-                'Finished worktrees beyond the keep-limit are reclaimed now (directory only). Their branches are kept, so the work stays recoverable.'
+                <>
+                  Finished worktrees beyond the keep-limit are reclaimed now (directory only).
+                  Their branches are kept, so the work stays recoverable.
+                  {busy ? (
+                    <span className="mt-2 block text-xs text-soft-foreground">
+                      Running the worktree teardown commands — one pass per worktree, so this can
+                      take a moment.
+                    </span>
+                  ) : null}
+                </>
               )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Keep it</AlertDialogCancel>
+            <AlertDialogCancel disabled={busy}>Keep it</AlertDialogCancel>
             <AlertDialogAction
               data-action="worktrees-confirm"
               className={confirming?.kind === 'delete' ? 'bg-danger text-danger-foreground hover:brightness-[0.96]' : undefined}
-              onClick={runConfirmed}
+              disabled={busy}
+              onClick={(event) => {
+                // Radix closes the dialog on click; the busy dialog *is* the progress report.
+                event.preventDefault()
+                runConfirmed()
+              }}
             >
-              {confirming?.kind === 'delete' ? 'Delete' : 'Reclaim now'}
+              {busy
+                ? confirming?.kind === 'delete'
+                  ? 'Deleting…'
+                  : 'Reclaiming…'
+                : confirming?.kind === 'delete'
+                  ? 'Delete'
+                  : 'Reclaim now'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

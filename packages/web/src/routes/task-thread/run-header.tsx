@@ -955,8 +955,15 @@ function ActionsKebab({
 /** The destructive confirms — one dialog, two scripts. Never a native confirm(). */
 function ConfirmDialog({ run, actions }: { run: ApiRun; actions: RunActions }) {
   const confirming = actions.confirming
+  // Delete removes the worktree, and that runs the project's teardown commands on the server —
+  // seconds to minutes. Closing the dialog on click left the task sitting in the list with no
+  // sign anything was happening, so the dialog stays up and busy until the server answers.
+  const pending = actions.delete.isPending || actions.cancel.isPending
   return (
-    <AlertDialog open={confirming !== null} onOpenChange={(open) => !open && actions.setConfirming(null)}>
+    <AlertDialog
+      open={confirming !== null}
+      onOpenChange={(open) => !open && !pending && actions.setConfirming(null)}
+    >
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>{confirming === 'delete' ? 'Delete this task?' : 'Cancel this task?'}</AlertDialogTitle>
@@ -968,6 +975,11 @@ function ConfirmDialog({ run, actions }: { run: ApiRun; actions: RunActions }) {
                 <span className="mt-1 block truncate font-medium text-foreground" title={runTitle(run)}>
                   {runTitle(run)}
                 </span>
+                {pending ? (
+                  <span className="mt-2 block text-xs text-soft-foreground">
+                    Running the worktree teardown commands — this can take a moment.
+                  </span>
+                ) : null}
               </>
             ) : (
               'The agent is stopped and the run completes as cancelled. The worktree stays.'
@@ -975,16 +987,25 @@ function ConfirmDialog({ run, actions }: { run: ApiRun; actions: RunActions }) {
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel>Keep it</AlertDialogCancel>
+          <AlertDialogCancel disabled={pending}>Keep it</AlertDialogCancel>
           <AlertDialogAction
             className="bg-danger text-danger-foreground hover:brightness-[0.96]"
-            onClick={() => {
-              if (confirming === 'delete') actions.delete.mutate()
-              else actions.cancel.mutate()
-              actions.setConfirming(null)
+            disabled={pending}
+            onClick={(event) => {
+              // Radix closes the dialog on click; the busy dialog *is* the progress report.
+              event.preventDefault()
+              const settle = { onSettled: () => actions.setConfirming(null) }
+              if (confirming === 'delete') actions.delete.mutate(undefined, settle)
+              else actions.cancel.mutate(undefined, settle)
             }}
           >
-            {confirming === 'delete' ? 'Delete' : 'Cancel the run'}
+            {pending
+              ? confirming === 'delete'
+                ? 'Deleting…'
+                : 'Cancelling…'
+              : confirming === 'delete'
+                ? 'Delete'
+                : 'Cancel the run'}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
