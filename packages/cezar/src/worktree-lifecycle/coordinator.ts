@@ -49,6 +49,7 @@ export class WorktreeLifecycleCoordinator {
     isActive: (runId: string) => boolean;
     cancelAndWait: (runId: string) => Promise<boolean>;
     cancelPending?: (runId: string) => void;
+    onWorktreeRemoved?: () => Promise<void>;
     resume: (runId: string, launch: LifecyclePendingLaunch | undefined) => Promise<void>;
   }) {
     try { this.root = realpathSync(root); } catch { /* missing roots remain a local attention failure */ }
@@ -315,6 +316,7 @@ export class WorktreeLifecycleCoordinator {
           else if (this.runs.getRun(record.runId)) this.runs.updateRun(record.runId, operation.intent === 'reclaim'
             ? {worktreeReclaimedAt: now()} : {worktreePath: undefined, branch: undefined});
         }
+        await this.options.onWorktreeRemoved?.();
         delete record.preparedBy;
       }
       operation.state = operation.phase === 'setup' && operation.decision?.action === 'start-anyway' ? 'bypassed' : 'completed';

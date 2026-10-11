@@ -60,6 +60,30 @@ afterEach(async () => {
 });
 
 describe('RunManager worktree lifecycle admission', () => {
+  it.each(['reclaim', 'remove-worktree', 'delete-task', 'discard-variant'] as const)('sweeps the last PR head ref only after %s teardown removes its worktree', async intent => {
+    const p = await project();
+    await writeLifecycleConfig(p.root, {afterCreate: [entry('true')], beforeRemove: [entry('touch {{ root_path }}/cleanup-started; while [ ! -e {{ root_path }}/release-cleanup ]; do sleep 0.02; done')]}, null);
+    const run = p.manager.startRun(workflow, {task: 'PR head cleanup', runner: 'claude'});
+    await wait(() => expect(p.manager.isActive(run.id)).toBe(false));
+    const worktreePath = p.store.getRun(run.id)!.worktreePath!;
+    const head = (await exec('git', ['rev-parse', 'HEAD'], {cwd: p.root})).stdout.trim();
+    const ref = 'refs/cezar/pr/42';
+    await exec('git', ['update-ref', ref, head], {cwd: p.root});
+    p.store.updateRun(run.id, {prHead: {number: 42, repo: 'fixture/project', headRepo: 'fixture/project', headRef: 'feature', headSha: head, baseRef: 'main', ref}});
+    p.manager.lifecycle.start();
+    const operation = intent === 'discard-variant'
+      ? await p.manager.lifecycle.discardVariant(run.id)
+      : await p.manager.lifecycle.startRemoval({requestId: randomUUID(), runId: run.id, intent});
+    expect(operation).not.toBeNull();
+    await wait(() => expect(existsSync(join(p.root, 'cleanup-started'))).toBe(true));
+    await expect(exec('git', ['show-ref', '--verify', ref], {cwd: p.root})).resolves.toBeDefined();
+    expect(existsSync(worktreePath)).toBe(true);
+    writeFileSync(join(p.root, 'release-cleanup'), 'go');
+    await vi.waitFor(async () => expect((await p.manager.lifecycle.operation(operation!.id)).state).toBe('completed'), {timeout: 12_000, interval: 25});
+    expect(existsSync(worktreePath)).toBe(false);
+    await expect(exec('git', ['show-ref', '--verify', ref], {cwd: p.root})).rejects.toMatchObject({code: 128});
+  });
+
   it('starts no agent until setup completed in its isolated worktree', async () => {
     const p = await project();
     await writeLifecycleConfig(p.root, { afterCreate: [entry('touch {{ root_path }}/setup-started; while [ ! -e {{ root_path }}/release ]; do sleep 0.02; done; printf prepared > setup-ready')], beforeRemove: [] }, null);
